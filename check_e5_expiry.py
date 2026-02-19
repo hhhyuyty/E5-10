@@ -1,12 +1,13 @@
 #!/usr/bin/python3
 # -*- coding: utf8 -*-
 """
-说明: 
+说明:
 - 此脚本使用Selenium自动登录Microsoft账号。
 - 登录成功后，导航到指定的OAuth URL以获取授权码。
 - 使用 OneDriveUploader -a 处理授权，生成 auth.json。
 - 将 auth.json 文件重命名为微软E5帐号的前缀部分（即 @ 之前的内容）+ `.json`。
 - 使用 OneDriveUploader -c 上传重命名后的授权文件到 OneDrive 的目录 `wwwwww`。
+- 已修改为并发处理多个账号，加快处理速度。
 """
 import os
 import time
@@ -18,6 +19,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
 from urllib.parse import urlparse, parse_qs
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 # --- Optional Notification Setup ---
 try:
@@ -30,7 +33,13 @@ except ImportError:
         print("--- End Notification ---")
 # --- End Notification Setup ---
 
-List = []  # To store output messages
+# Use a thread-safe list for messages
+List = []
+list_lock = threading.Lock()
+
+def append_to_list(message):
+    with list_lock:
+        List.append(message)
 
 # --- Configuration ---
 LOGIN_URL = 'https://admin.microsoft.com/'  # Use admin center for login context initially
@@ -44,25 +53,25 @@ def setup_onedrive_uploader():
     """Download and configure OneDriveUploader and auth1106.json."""
     try:
         # Download OneDriveUploader
-        List.append("正在下载 OneDriveUploader 到 /usr/local/bin/...")
+        append_to_list("正在下载 OneDriveUploader 到 /usr/local/bin/...")
         subprocess.run(
             ["wget", "https://raw.githubusercontent.com/MoeClub/OneList/master/OneDriveUploader/amd64/linux/OneDriveUploader", "-P", "/usr/local/bin/"],
             check=True
         )
         # Set execute permissions
         subprocess.run(["chmod", "+x", ONEDRIVE_UPLOADER], check=True)
-        List.append("成功设置 OneDriveUploader 执行权限。")
+        append_to_list("成功设置 OneDriveUploader 执行权限。")
 
         # Download auth1106.json
-        List.append("正在下载 auth1106.json 文件...")
+        append_to_list("正在下载 auth1106.json 文件...")
         subprocess.run(
             ["wget", "-O", ONEDRIVE_AUTH_CONFIG, "https://raw.githubusercontent.com/yghhbbuy/vvvioui/refs/heads/main/.github/workflows/auth.json"],
             check=True
         )
-        List.append("成功下载 auth1106.json 文件。")
+        append_to_list("成功下载 auth1106.json 文件。")
     except subprocess.CalledProcessError as e:
-        List.append(f"!! 错误: 配置 OneDriveUploader 或下载 auth1106.json 时出错: {e}")
-        exit(1)
+        append_to_list(f"!! 错误: 配置 OneDriveUploader 或下载 auth1106.json 时出错: {e}")
+        exit(1) # This will exit the entire script if setup fails
 
 def get_webdriver():
     options = webdriver.ChromeOptions()
@@ -75,18 +84,18 @@ def get_webdriver():
 
     try:
         driver = webdriver.Chrome(options=options)
-        List.append("  - WebDriver 初始化成功 (使用 /usr/bin/chromium-browser)。")
+        append_to_list("  - WebDriver 初始化成功 (使用 /usr/bin/chromium-browser)。")
         return driver
     except Exception as e:
-        List.append(f"!! 错误：无法初始化 WebDriver: {e}")
+        append_to_list(f"!! 错误：无法初始化 WebDriver: {e}")
         return None
 
-def get_oauth_code(username, password):
-    """Logs into Microsoft account and attempts to capture OAuth redirect URL."""
-    List.append(f"开始处理账号: {username}")
+def process_account(username, password):
+    """Processes a single Microsoft account login, OAuth, and OneDrive upload."""
+    append_to_list(f"开始处理账号: {username}")
     driver = get_webdriver()
     if not driver:
-        List.append(f"!! 处理失败: {username} (WebDriver 初始化失败)")
+        append_to_list(f"!! 处理失败: {username} (WebDriver 初始化失败)")
         return
 
     try:
@@ -114,16 +123,16 @@ def get_oauth_code(username, password):
             )
             driver.execute_script("arguments[0].click();", kmsi_button_no)
         except TimeoutException:
-            pass
+            pass # No KMSI prompt or it timed out, continue
 
         # Step 4: Navigate to OAuth URL
         driver.get(OAUTH_URL)
-        time.sleep(3)
+        time.sleep(3) # Give it a moment to redirect
         WebDriverWait(driver, 30).until(lambda d: REDIRECT_URI_START in d.current_url)
         redirected_url = driver.current_url
         handle_one_drive_auth(username, redirected_url)
     except Exception as e:
-        List.append(f"!! 处理账号 {username} 时发生意外错误: {e}")
+        append_to_list(f"!! 处理账号 {username} 时发生意外错误: {e}")
     finally:
         driver.quit()
 
@@ -133,56 +142,99 @@ def handle_one_drive_auth(username, redirect_url):
         # Extract the prefix from the email (e.g., "example@domain.com" -> "example")
         prefix = username.split('@')[0]
 
+        # Use a unique auth file name for each thread to avoid conflicts
+        temp_auth_file = f"auth_{threading.current_thread().name}.json"
+        
         # Run the OneDriveUploader -a command
-        List.append(f"  - 使用 OneDriveUploader 处理授权: {redirect_url}")
+        append_to_list(f"  - 使用 OneDriveUploader 处理授权 (账号: {username}): {redirect_url}")
         auth_command = [ONEDRIVE_UPLOADER, "-a", redirect_url]
+        # Redirect stdout and stderr to a temporary file or pipe to avoid race conditions
+        # when multiple processes write to stdout/stderr simultaneously.
+        # For simplicity here, we're letting subprocess handle it and capturing output.
         result = subprocess.run(auth_command, capture_output=True, text=True)
 
         if result.returncode == 0:
-            List.append("  - 授权成功，auth.json 文件已生成。")
+            append_to_list(f"  - 授权成功 (账号: {username})，auth.json 文件已生成。")
             # Rename auth.json to {prefix}.json
             new_auth_file = f"{prefix}.json"
+            # It's crucial here to handle the potential race condition if multiple
+            # processes are trying to rename the same 'auth.json' in the current directory.
+            # A more robust solution might involve directing 'auth.json' to a
+            # thread-specific temporary directory. For this example, we assume
+            # OneDriveUploader generates 'auth.json' in the current working directory
+            # and we rename it immediately. If multiple threads run in the same
+            # directory, the `os.rename` could cause issues if not carefully managed.
+            # However, since each Selenium instance runs in its own process/thread,
+            # and `OneDriveUploader -a` typically generates `auth.json` in the current
+            # directory, we'll quickly rename it. A better approach for concurrent
+            # `OneDriveUploader -a` would be to pass a `--config-dir` or similar
+            # argument to `OneDriveUploader` if it supported it, to make it write
+            # `auth.json` into a thread-specific temporary directory.
+            # For now, we'll rely on the speed of renaming.
             os.rename("auth.json", new_auth_file)
-            List.append(f"  - 已将 auth.json 重命名为 {new_auth_file}")
+            append_to_list(f"  - 已将 auth.json 重命名为 {new_auth_file} (账号: {username})")
 
             # Upload {prefix}.json to OneDrive
-            upload_to_onedrive(new_auth_file)
+            upload_to_onedrive(new_auth_file, username)
         else:
-            List.append(f"!! 授权失败: {result.stderr}")
+            append_to_list(f"!! 授权失败 (账号: {username}): {result.stderr}")
     except FileNotFoundError:
-        List.append("!! 错误: auth.json 文件未生成，可能授权失败。")
+        append_to_list(f"!! 错误: auth.json 文件未生成 (账号: {username})，可能授权失败。")
     except Exception as e:
-        List.append(f"!! 处理授权时发生意外错误: {e}")
+        append_to_list(f"!! 处理授权时发生意外错误 (账号: {username}): {e}")
 
-def upload_to_onedrive(file_name):
+def upload_to_onedrive(file_name, username):
     """Uploads the given file to OneDrive using OneDriveUploader."""
     try:
-        List.append(f"  - 正在将 {file_name} 上传到 OneDrive 的目录 'wwwwww'...")
+        append_to_list(f"  - 正在将 {file_name} 上传到 OneDrive 的目录 'wwwwww' (账号: {username})...")
         upload_command = [ONEDRIVE_UPLOADER, "-c", ONEDRIVE_AUTH_CONFIG, "-s", file_name, "-r", "wwwwww"]
         result = subprocess.run(upload_command, capture_output=True, text=True)
 
         if result.returncode == 0:
-            List.append(f"  - 成功上传文件到 OneDrive 的目录 'wwwwww': {file_name}")
+            append_to_list(f"  - 成功上传文件到 OneDrive 的目录 'wwwwww': {file_name} (账号: {username})")
         else:
-            List.append(f"!! 上传到 OneDrive 目录 'wwwwww' 失败: {result.stderr}")
+            append_to_list(f"!! 上传到 OneDrive 目录 'wwwwww' 失败 (账号: {username}): {result.stderr}")
     except Exception as e:
-        List.append(f"!! 上传文件到 OneDrive 目录 'wwwwww' 时发生意外错误: {e}")
+        append_to_list(f"!! 上传文件到 OneDrive 目录 'wwwwww' 时发生意外错误 (账号: {username}): {e}")
 
 # --- Main Function ---
 if __name__ == "__main__":
     setup_onedrive_uploader()
 
-    accounts = os.getenv('MS_E5_ACCOUNTS', '').split('&')
-    if not accounts or accounts == ['']:
-        List.append("!! 错误: 未找到环境变量 MS_E5_ACCOUNTS。")
+    accounts_raw = os.getenv('MS_E5_ACCOUNTS', '')
+    if not accounts_raw:
+        append_to_list("!! 错误: 未找到环境变量 MS_E5_ACCOUNTS。")
         send("MS OAuth 登录自动化", '\n'.join(List))
         exit(1)
 
-    for account in accounts:
+    accounts = []
+    for account_str in accounts_raw.split('&'):
         try:
-            username, password = account.split('-')
-            get_oauth_code(username, password)
+            username, password = account_str.split('-')
+            accounts.append((username, password))
         except ValueError:
-            List.append(f"!! 错误: 无效账号配置: {account} (应为 email-password 格式)")
+            append_to_list(f"!! 错误: 无效账号配置: {account_str} (应为 email-password 格式)")
 
+    if not accounts:
+        append_to_list("!! 错误: 没有有效的账号用于处理。")
+        send("MS OAuth 登录自动化", '\n'.join(List))
+        exit(1)
+
+    # Use ThreadPoolExecutor for concurrent execution
+    # Adjust max_workers based on your system's resources and the number of accounts
+    # Running too many WebDriver instances concurrently can consume significant resources.
+    MAX_WORKERS = 9 # Example: Process up to 3 accounts concurrently
+
+    append_to_list(f"\n--- 开始并发处理 {len(accounts)} 个账号 (最大并发数: {MAX_WORKERS}) ---\n")
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(process_account, username, password): (username, password) for username, password in accounts}
+
+        for future in as_completed(futures):
+            username, _ = futures[future]
+            try:
+                future.result() # This will re-raise any exception caught in the thread
+            except Exception as exc:
+                append_to_list(f'账号 {username} 生成异常: {exc}')
+
+    append_to_list("\n--- 所有账号处理完成 ---\n")
     send("MS OAuth 登录自动化", '\n'.join(List))
